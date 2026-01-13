@@ -2,10 +2,35 @@ from fastapi import APIRouter
 from app.ado_client import ado_get
 from app.config import settings
 from datetime import datetime
+from typing import Dict, List
 
 router = APIRouter(prefix="/api/meta", tags=["Metadata"])
 
-def extract_iterations(node, parent=None, level=0, result=[]):
+
+def clean_iteration_path(path: str) -> str:
+    """
+    Ensures no leading backslashes.
+    DOES NOT modify valid hierarchy.
+    """
+    """
+    Removes the 'Iteration' node from Azure DevOps iteration paths
+    """
+    if not path:
+        return ""
+
+    parts = path.strip("\\").split("\\")
+    cleaned = [p for p in parts if p.lower() != "iteration"]
+    return "\\".join(cleaned)
+
+
+def extract_iterations(
+    node: Dict,
+    level: int = 0,
+    result: List[Dict] | None = None
+):
+    if result is None:
+        result = []
+
     attrs = node.get("attributes", {})
     start = attrs.get("startDate")
     end = attrs.get("finishDate")
@@ -16,9 +41,11 @@ def extract_iterations(node, parent=None, level=0, result=[]):
         e = datetime.fromisoformat(end[:10])
         duration = (e - s).days + 1
 
+    raw_path = clean_iteration_path(node.get("path", ""))
+
     result.append({
-        "iteration_path": node["path"],
-        "sprint_name": node["name"],
+        "iteration_path": raw_path,
+        "sprint_name": node.get("name"),
         "start_date": start,
         "end_date": end,
         "duration_days": duration,
@@ -26,9 +53,10 @@ def extract_iterations(node, parent=None, level=0, result=[]):
     })
 
     for child in node.get("children", []):
-        extract_iterations(child, node["path"], level + 1, result)
+        extract_iterations(child, level + 1, result)
 
     return result
+
 
 @router.get("/iterations")
 def iteration_paths(project: str):
