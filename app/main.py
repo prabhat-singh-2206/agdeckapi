@@ -6,7 +6,12 @@ from .routers import (
     meta_iteration_paths,
     meta_sprints,
     work_items,
-    bug_quality
+    bug_quality,
+    efficiency,
+    ontime,
+    quality,
+    governance,
+    prs      
 )
 
 app = FastAPI(title="ADO Metadata APIs")
@@ -18,3 +23,8 @@ app.include_router(meta_iteration_paths.router)
 app.include_router(meta_sprints.router)
 app.include_router(work_items.router)
 app.include_router(bug_quality.router)
+app.include_router(efficiency.router)
+app.include_router(ontime.router)
+app.include_router(quality.router)
+app.include_router(governance.router) 
+app.include_router(prs.router)
