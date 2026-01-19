@@ -19,6 +19,11 @@ def ado_get(url: str):
 
 def ado_post(url: str, payload: dict):
     r = requests.post(url, headers=_auth_header(), json=payload)
-    if r.status_code not in (200, 201):
-        raise HTTPException(status_code=r.status_code, detail=r.text)
+
+    if r.status_code >= 400:
+        raise HTTPException(
+            status_code=r.status_code,
+            detail=r.text
+        )
+
     return r.json()

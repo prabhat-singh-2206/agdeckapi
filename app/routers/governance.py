@@ -1,10 +1,16 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from app.config import settings
-from app.ado_client import ado_post, ado_get
+from app.ado_client import ado_get, ado_post
 from collections import defaultdict
 from datetime import datetime, timedelta
 
 router = APIRouter(prefix="/governance", tags=["Governance"])
+
+
+# ---------------- HELPERS ----------------
+def chunk_list(items, size=200):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
 
 
 def derive_role(name: str):
@@ -16,45 +22,39 @@ def derive_role(name: str):
     return "Developer"
 
 
+# ---------------- API ----------------
 @router.get("/individuals")
 def governance_individuals(
     project: str,
     area_path: str,
-    iteration_path: str | None = None,
     days: int = 30
 ):
     """
-    Governance View: Individual vs Productivity
+    Governance – Individual & Role Mapping
+
+    Filters:
+    - Project
+    - Area Path
+    - Last N days (ChangedDate)
     """
 
     # ---------------- CLEAN INPUT ----------------
     project = project.strip()
-    area_path = area_path.strip().replace("\\\\", "\\")  # fix double backslashes
-    if iteration_path:
-        iteration_path = iteration_path.strip().replace("\\\\", "\\")
+    area_path = area_path.strip().replace("\\\\", "\\")
+    since_date = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
 
-    # ---------------- WIQL ----------------
-    wiql_conditions = [
-        f"[System.TeamProject] = '{project}'",
-        f"[System.AreaPath] UNDER '{area_path}'",
-        "[System.WorkItemType] IN ('User Story','Bug')"
-    ]
-
-    if iteration_path:
-        wiql_conditions.append(
-            f"[System.IterationPath] = '{iteration_path}'"
-        )
-
+    # ---------------- WIQL (SAFE + BOUNDED) ----------------
     wiql = {
         "query": f"""
         SELECT [System.Id]
         FROM WorkItems
-        WHERE {' AND '.join(wiql_conditions)}
+        WHERE
+          [System.TeamProject] = '{project}'
+          AND [System.AreaPath] UNDER '{area_path}'
+          AND [System.WorkItemType] IN ('User Story','Bug')
+          AND [System.ChangedDate] >= '{since_date}'
         """
     }
-
-    # Debug print to verify exact WIQL sent to ADO
-    print("DEBUG WIQL:", wiql)
 
     wiql_url = (
         f"https://dev.azure.com/{settings.ADO_ORG}/"
@@ -68,27 +68,15 @@ def governance_individuals(
         return {
             "project": project,
             "area_path": area_path,
-            "iteration_path": iteration_path,
+            "days": days,
             "individuals": []
         }
 
-    # ---------------- BATCH DETAILS ----------------
+    # ---------------- WORK ITEM DETAILS ----------------
     batch_url = (
         f"https://dev.azure.com/{settings.ADO_ORG}/"
         f"{project}/_apis/wit/workitemsbatch?api-version=7.1"
     )
-
-    payload = {
-        "ids": ids,
-        "fields": [
-            "System.WorkItemType",
-            "System.State",
-            "System.AssignedTo",
-            "System.CreatedBy"
-        ]
-    }
-
-    items = ado_post(batch_url, payload).get("value", [])
 
     people = defaultdict(lambda: {
         "stories_completed": 0,
@@ -99,50 +87,63 @@ def governance_individuals(
         "pr_cycle_times": []
     })
 
-    # ---------------- WORK ITEM METRICS ----------------
-    for wi in items:
-        f = wi["fields"]
-        wi_type = f.get("System.WorkItemType")
-        state = f.get("System.State")
+    for batch in chunk_list(ids):
+        payload = {
+            "ids": batch,
+            "fields": [
+                "System.WorkItemType",
+                "System.State",
+                "System.AssignedTo",
+                "System.CreatedBy"
+            ]
+        }
 
-        assigned = f.get("System.AssignedTo", {}).get("displayName")
-        creator = f.get("System.CreatedBy", {}).get("displayName")
+        items = ado_post(batch_url, payload).get("value", [])
 
-        if wi_type == "User Story" and state == "Closed" and assigned:
-            people[assigned]["stories_completed"] += 1
+        for wi in items:
+            f = wi["fields"]
+            wi_type = f.get("System.WorkItemType")
+            state = f.get("System.State")
 
-        if wi_type == "Bug":
-            if creator:
-                people[creator]["bugs_created"] += 1
-            if assigned and state == "Closed":
-                people[assigned]["bugs_fixed"] += 1
+            assigned = (f.get("System.AssignedTo") or {}).get("displayName")
+            creator = (f.get("System.CreatedBy") or {}).get("displayName")
+
+            if wi_type == "User Story" and state == "Closed" and assigned:
+                people[assigned]["stories_completed"] += 1
+
+            if wi_type == "Bug":
+                if creator:
+                    people[creator]["bugs_created"] += 1
+                if assigned and state == "Closed":
+                    people[assigned]["bugs_fixed"] += 1
 
     # ---------------- PR METRICS ----------------
-    since = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
+    since_iso = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
 
     repos = ado_get(
-        f"https://dev.azure.com/{settings.ADO_ORG}/{project}/_apis/git/repositories?api-version=7.1"
+        f"https://dev.azure.com/{settings.ADO_ORG}/"
+        f"{project}/_apis/git/repositories?api-version=7.1"
     ).get("value", [])
 
     for repo in repos:
         repo_id = repo["id"]
-        repo_name = repo.get("name", "Unknown")
+
         try:
             prs = ado_get(
-                f"https://dev.azure.com/{settings.ADO_ORG}/{project}/"
-                f"_apis/git/repositories/{repo_id}/pullrequests"
+                f"https://dev.azure.com/{settings.ADO_ORG}/{project}"
+                f"/_apis/git/repositories/{repo_id}/pullrequests"
                 f"?searchCriteria.status=completed"
-                f"&searchCriteria.minTime={since}"
+                f"&searchCriteria.minTime={since_iso}"
                 f"&api-version=7.1"
             ).get("value", [])
-        except Exception as e:
-            print(f"Skipping repo '{repo_name}' due to error: {e}")
+        except Exception:
             continue
 
         for pr in prs:
             creator = pr["createdBy"].get("displayName")
             if not creator:
                 continue
+
             created = datetime.fromisoformat(pr["creationDate"][:-1])
             merged = datetime.fromisoformat(pr["closedDate"][:-1])
 
@@ -153,18 +154,19 @@ def governance_individuals(
 
             for r in pr.get("reviewers", []):
                 if r.get("vote", 0) > 0:
-                    people[r.get("displayName", "Unknown")]["prs_approved"] += 1
+                    reviewer = r.get("displayName")
+                    if reviewer:
+                        people[reviewer]["prs_approved"] += 1
 
     # ---------------- RESPONSE ----------------
-    individuals = []
+    squad = area_path.split("\\")[-1]
 
+    individuals = []
     for name, m in people.items():
         avg_cycle = (
             round(sum(m["pr_cycle_times"]) / len(m["pr_cycle_times"]), 2)
             if m["pr_cycle_times"] else 0
         )
-
-        squad = area_path.split("\\")[-1] if "\\" in area_path else area_path
 
         individuals.append({
             "user_id": name,
@@ -185,6 +187,6 @@ def governance_individuals(
     return {
         "project": project,
         "area_path": area_path,
-        "iteration_path": iteration_path,
+        "days": days,
         "individuals": individuals
     }
