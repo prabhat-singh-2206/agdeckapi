@@ -1,192 +1,102 @@
-from fastapi import APIRouter, HTTPException
-from app.config import settings
-from app.ado_client import ado_get, ado_post
+from fastapi import APIRouter, Query
 from collections import defaultdict
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from app.ado_client import ado_post, ado_get
+from app.config import settings
+import functools
 
 router = APIRouter(prefix="/governance", tags=["Governance"])
 
+STORY_TYPES = ["User Story", "Requirement", "Product Backlog Item"]
 
-# ---------------- HELPERS ----------------
-def chunk_list(items, size=200):
-    for i in range(0, len(items), size):
-        yield items[i:i + size]
+@functools.lru_cache(maxsize=2048)
+def fetch_wi_revisions(project, wid):
+    """
+    Isolated function for parallel execution to fetch history.
+    Using lru_cache ensures we don't fetch the same ID twice across requests.
+    """
+    url = f"https://dev.azure.com/{settings.ADO_ORG}/{project}/_apis/wit/workItems/{wid}/revisions?api-version=7.1"
+    try:
+        res = ado_get(url)
+        # Extract unique display names from revisions
+        return {
+            rev.get("fields", {}).get("System.ChangedBy", {}).get("displayName")
+            for rev in res.get("value", [])
+            if rev.get("fields", {}).get("System.ChangedBy")
+        }
+    except:
+        return set()
 
-
-def derive_role(name: str):
-    n = name.upper()
-    if "QA" in n:
-        return "QA"
-    if "LEAD" in n:
-        return "Tech Lead"
-    return "Developer"
-
-
-# ---------------- API ----------------
 @router.get("/individuals")
 def governance_individuals(
     project: str,
     area_path: str,
-    days: int = 30
+    days: int = Query(30, gt=0, le=365)
 ):
-    """
-    Governance – Individual & Role Mapping
+    since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
 
-    Filters:
-    - Project
-    - Area Path
-    - Last N days (ChangedDate)
-    """
-
-    # ---------------- CLEAN INPUT ----------------
-    project = project.strip()
-    area_path = area_path.strip().replace("\\\\", "\\")
-    since_date = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
-
-    # ---------------- WIQL (SAFE + BOUNDED) ----------------
+    # 1. Fetch Work Item IDs (WIQL is fast)
+    wiql_url = f"https://dev.azure.com/{settings.ADO_ORG}/{project}/_apis/wit/wiql?api-version=7.1"
     wiql = {
-        "query": f"""
-        SELECT [System.Id]
-        FROM WorkItems
-        WHERE
-          [System.TeamProject] = '{project}'
-          AND [System.AreaPath] UNDER '{area_path}'
-          AND [System.WorkItemType] IN ('User Story','Bug')
-          AND [System.ChangedDate] >= '{since_date}'
-        """
+        "query": f"SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '{project}' AND [System.AreaPath] UNDER '{area_path}' AND [System.ChangedDate] >= '{since}'"
     }
-
-    wiql_url = (
-        f"https://dev.azure.com/{settings.ADO_ORG}/"
-        f"{project}/_apis/wit/wiql?api-version=7.1"
-    )
-
-    wiql_res = ado_post(wiql_url, wiql)
-    ids = [i["id"] for i in wiql_res.get("workItems", [])]
+    ids = [w["id"] for w in ado_post(wiql_url, wiql).get("workItems", [])]
 
     if not ids:
-        return {
-            "project": project,
-            "area_path": area_path,
-            "days": days,
-            "individuals": []
-        }
+        return {"individuals": []}
 
-    # ---------------- WORK ITEM DETAILS ----------------
-    batch_url = (
-        f"https://dev.azure.com/{settings.ADO_ORG}/"
-        f"{project}/_apis/wit/workitemsbatch?api-version=7.1"
-    )
+    # 2. BATCH Fetch Work Item Types (Massive Speedup vs individual calls)
+    # This replaces individual 'get' calls for work item details.
+    batch_url = f"https://dev.azure.com/{settings.ADO_ORG}/{project}/_apis/wit/workitemsbatch?api-version=7.1"
+    type_map = {}
+    for i in range(0, len(ids), 200):
+        batch = ids[i:i+200]
+        items = ado_post(batch_url, {"ids": batch, "fields": ["System.WorkItemType"]}).get("value", [])
+        for item in items:
+            type_map[item["id"]] = item.get("fields", {}).get("System.WorkItemType")
 
-    people = defaultdict(lambda: {
-        "stories_completed": 0,
-        "bugs_created": 0,
-        "bugs_fixed": 0,
-        "prs_raised": 0,
-        "prs_approved": 0,
-        "pr_cycle_times": []
-    })
+    # 3. HIGH-SPEED Parallel Revision Fetching
+    # Increased max_workers to 50 for I/O bound tasks to maximize bandwidth
+    contribution = defaultdict(lambda: {"User Stories": 0, "Bugs": 0, "PRs": 0})
+    
+    with ThreadPoolExecutor(max_workers=50) as executor:
+        future_to_wid = {executor.submit(fetch_wi_revisions, project, wid): wid for wid in ids}
+        
+        for future in as_completed(future_to_wid):
+            wid = future_to_wid[future]
+            wtype = type_map.get(wid)
+            contributors = future.result()
+            
+            for user in contributors:
+                if wtype in STORY_TYPES:
+                    contribution[user]["User Stories"] += 1
+                elif wtype == "Bug":
+                    contribution[user]["Bugs"] += 1
 
-    for batch in chunk_list(ids):
-        payload = {
-            "ids": batch,
-            "fields": [
-                "System.WorkItemType",
-                "System.State",
-                "System.AssignedTo",
-                "System.CreatedBy"
-            ]
-        }
-
-        items = ado_post(batch_url, payload).get("value", [])
-
-        for wi in items:
-            f = wi["fields"]
-            wi_type = f.get("System.WorkItemType")
-            state = f.get("System.State")
-
-            assigned = (f.get("System.AssignedTo") or {}).get("displayName")
-            creator = (f.get("System.CreatedBy") or {}).get("displayName")
-
-            if wi_type == "User Story" and state == "Closed" and assigned:
-                people[assigned]["stories_completed"] += 1
-
-            if wi_type == "Bug":
-                if creator:
-                    people[creator]["bugs_created"] += 1
-                if assigned and state == "Closed":
-                    people[assigned]["bugs_fixed"] += 1
-
-    # ---------------- PR METRICS ----------------
-    since_iso = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
-
-    repos = ado_get(
-        f"https://dev.azure.com/{settings.ADO_ORG}/"
-        f"{project}/_apis/git/repositories?api-version=7.1"
-    ).get("value", [])
-
+    # 4. Optimized PR Fetching
+    pr_since = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
+    repos = ado_get(f"https://dev.azure.com/{settings.ADO_ORG}/{project}/_apis/git/repositories?api-version=7.1").get("value", [])
+    
+    # Only fetch PRs for repos that had activity (optional: can be further optimized)
     for repo in repos:
-        repo_id = repo["id"]
-
-        try:
-            prs = ado_get(
-                f"https://dev.azure.com/{settings.ADO_ORG}/{project}"
-                f"/_apis/git/repositories/{repo_id}/pullrequests"
-                f"?searchCriteria.status=completed"
-                f"&searchCriteria.minTime={since_iso}"
-                f"&api-version=7.1"
-            ).get("value", [])
-        except Exception:
-            continue
-
+        pr_url = f"https://dev.azure.com/{settings.ADO_ORG}/{project}/_apis/git/repositories/{repo['id']}/pullrequests?searchCriteria.minTime={pr_since}&searchCriteria.status=completed&api-version=7.1"
+        prs = ado_get(pr_url).get("value", [])
         for pr in prs:
-            creator = pr["createdBy"].get("displayName")
-            if not creator:
-                continue
+            owner = pr.get("createdBy", {}).get("displayName")
+            if owner:
+                contribution[owner]["PRs"] += 1
 
-            created = datetime.fromisoformat(pr["creationDate"][:-1])
-            merged = datetime.fromisoformat(pr["closedDate"][:-1])
-
-            people[creator]["prs_raised"] += 1
-            people[creator]["pr_cycle_times"].append(
-                (merged - created).days
-            )
-
-            for r in pr.get("reviewers", []):
-                if r.get("vote", 0) > 0:
-                    reviewer = r.get("displayName")
-                    if reviewer:
-                        people[reviewer]["prs_approved"] += 1
-
-    # ---------------- RESPONSE ----------------
-    squad = area_path.split("\\")[-1]
-
-    individuals = []
-    for name, m in people.items():
-        avg_cycle = (
-            round(sum(m["pr_cycle_times"]) / len(m["pr_cycle_times"]), 2)
-            if m["pr_cycle_times"] else 0
-        )
-
-        individuals.append({
-            "user_id": name,
+    # 5. Build Final Response
+    individuals = [
+        {
             "name": name,
-            "role": derive_role(name),
-            "squad": squad,
-            "project": project,
-            "activity_metrics": {
-                "stories_completed": m["stories_completed"],
-                "bugs_created": m["bugs_created"],
-                "bugs_fixed": m["bugs_fixed"],
-                "prs_raised": m["prs_raised"],
-                "prs_approved": m["prs_approved"],
-                "avg_pr_cycle_time_days": avg_cycle
-            }
-        })
+            "metrics": {**stats, "total": sum(stats.values())}
+        } for name, stats in contribution.items()
+    ]
 
     return {
         "project": project,
         "area_path": area_path,
-        "days": days,
-        "individuals": individuals
+        "individuals": sorted(individuals, key=lambda x: x["metrics"]["total"], reverse=True)
     }
